@@ -1,0 +1,152 @@
+import torch
+import torch.nn as nn
+import pickle
+from typing import Optional, List, Callable
+import logging
+import os
+from datetime import datetime
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger("ContextualLayer")
+
+class ContextNode:
+    def __init__(self, context_clue: str, weight: float = 0.0, parent=None):
+        self.context_clue = context_clue
+        self.weight = weight
+        self.parent = parent
+        self.children: List[ContextNode] = []
+
+    def add_child(self, context_clue: str, weight: float = 0.0):
+        child = ContextNode(context_clue, weight, parent=self)
+        self.children.append(child)
+        logger.info(f"Added child node with context: '{context_clue}' and weight: {weight}")
+        return child
+
+    def edit_context(self, new_clue: str, new_weight: Optional[float] = None):
+        self.context_clue = new_clue
+        if new_weight is not None:
+            self.weight = new_weight
+        logger.info(f"Edited node context to: '{new_clue}' with new weight: {self.weight}")
+
+    def delete_node(self):
+        if self.parent:
+            self.parent.children.remove(self)
+        self.parent = None
+        logger.info(f"Deleted node with context: '{self.context_clue}'")
+        self.children.clear()
+
+    def corroborate(self, target_nodes: List['ContextNode']):
+        """Corroborate other nodes by increasing their weights."""
+        for node in target_nodes:
+            if node.weight < 10:  # Increase weight, but do not exceed 10
+                node.weight = min(10, node.weight + 1)
+                logger.info(f"Corroborated node '{node.context_clue}', increasing weight to {node.weight}")
+
+class ContextTree:
+    def __init__(self, root_context: str):
+        self.root = ContextNode(root_context, weight=5.0)
+    
+    def traverse_and_update(self, func: Callable[[ContextNode], None]):
+        def recurse(node):
+            func(node)
+            for child in node.children:
+                recurse(child)
+        
+        recurse(self.root)
+
+    def prune_tree(self, weight_threshold: float):
+        """Prune nodes in the tree with weights below the threshold."""
+        def prune_node(node):
+            if node.weight < weight_threshold:
+                node.delete_node()
+        
+        self.traverse_and_update(prune_node)
+
+class ContextualLayer(nn.Module):
+    def __init__(self, 
+                 input_size: int, 
+                 output_size: int,
+                 scoring_function: Callable[[torch.Tensor], float] = lambda x: x.mean().item(),
+                 context_update_function: Optional[Callable[[ContextNode, torch.Tensor], None]] = None,
+                 prune_weight_threshold: float = 2.0,
+                 save_interval: int = 5,
+                 max_saved_versions: int = 5):
+        super(ContextualLayer, self).__init__()
+        self.fc = nn.Linear(input_size, output_size)
+        self.context_tree = ContextTree(root_context="initial_context")
+        self.scoring_function = scoring_function
+        self.context_update_function = context_update_function or self.default_update_function
+        self.prune_weight_threshold = prune_weight_threshold
+        self.save_interval = save_interval
+        self.max_saved_versions = max_saved_versions
+        self.epoch_counter = 0
+        self.metadata_log = "context_tree_metadata.log"  # File to store metadata
+
+    def forward(self, x):
+        x = self.fc(x)
+        self.update_context_tree(x)
+        x = x * (1 + self.get_context_weight_factor())
+        return x
+
+    def update_context_tree(self, x: torch.Tensor):
+        def update_node(node):
+            self.context_update_function(node, x)
+            # If the node reaches a weight of 10, trigger corroboration
+            if node.weight == 10:
+                self.corroborate_nodes(node)
+        
+        self.context_tree.traverse_and_update(update_node)
+
+    def corroborate_nodes(self, high_weight_node: ContextNode):
+        """Corroborate other nodes based on a node with weight 10."""
+        related_nodes = self.find_related_nodes(high_weight_node)
+        high_weight_node.corroborate(related_nodes)
+
+    def find_related_nodes(self, high_weight_node: ContextNode) -> List[ContextNode]:
+        """Find nodes related to the high-weight node for corroboration."""
+        related_nodes = []
+
+        def collect_related_nodes(node):
+            if node != high_weight_node and node.weight < 10:
+                related_nodes.append(node)
+
+        # Traverse the tree to find all potential related nodes
+        self.context_tree.traverse_and_update(collect_related_nodes)
+        return related_nodes
+
+    def get_context_weight_factor(self) -> float:
+        weights = []
+        
+        def collect_weights(node):
+            weights.append(node.weight)
+        
+        self.context_tree.traverse_and_update(collect_weights)
+        return sum(weights) / len(weights) / 10.0
+
+    def default_update_function(self, node: ContextNode, x: torch.Tensor):
+        score = self.scoring_function(x)
+        if node.weight < 3:
+            node.delete_node()
+        elif len(node.children) < 2:
+            new_clue = f"Clue based on score {score:.2f}"
+            node.add_child(new_clue, weight=min(10.0, score))
+        else:
+            node.edit_context(node.context_clue, new_weight=score)
+
+    def prune_context_tree(self):
+        """Prune the context tree to remove low-weight nodes after each epoch."""
+        self.context_tree.prune_tree(self.prune_weight_threshold)
+        logger.info("Pruned context tree based on weight threshold")
+
+    def log_tree_structure(self):
+        """Log the structure of the context tree for debugging."""
+        def log_node(node, depth=0):
+            logger.info(f"{'  ' * depth}- Node: '{node.context_clue}' | Weight: {node.weight}")
+            for child in node.children:
+                log_node(child, depth + 1)
+        
+        logger.info("Context Tree Structure:")
+        log_node(self.context_tree.root)
+
+    # Additional methods for saving, loading, and cleaning up versions remain unchanged.
